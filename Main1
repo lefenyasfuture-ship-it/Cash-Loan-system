@@ -1,1 +1,1373 @@
+# Turnkey Cash Loan App — Starter Package
+
+This document contains the full **turnkey** starter code for a cash-loan management system you can ship to buyers. It includes all essential files: backend (Node.js/Express), database schema (SQLite for quick demo, PostgreSQL-ready), seed data, and deployment instructions.
+
+> Files included (paste each into its own file in a project folder):
+
+---
+
+## package.json
+
+```json
+{
+  "name": "turnkey-loan-app",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "init-db": "node server.js --init"
+  },
+  "dependencies": {
+    "bcrypt": "^5.1.1",
+    "cors": "^2.8.5",
+    "dayjs": "^1.11.11",
+    "dotenv": "^16.4.5",
+    "express": "^4.18.2",
+    "express-rate-limit": "^7.2.0",
+    "helmet": "^7.1.0",
+    "joi": "^17.9.2",
+    "jsonwebtoken": "^9.0.2",
+    "sqlite3": "^5.1.7",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}
+```
+
+---
+
+## .env.example
+
+```
+PORT=8080
+JWT_SECRET=change_this_to_a_long_random_string
+DB_PATH=./data/loanapp.sqlite
+ADMIN_EMAIL=admin@local
+ADMIN_PASS=admin123
+HOSTNAME=localhost
+```
+
+---
+
+## schema.sql
+
+```sql
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  email TEXT UNIQUE NOT NULL,
+  phone TEXT,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'officer',
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS borrowers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  first_name TEXT NOT NULL,
+  last_name TEXT NOT NULL,
+  id_number TEXT UNIQUE,
+  phone TEXT,
+  email TEXT,
+  address TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_by INTEGER REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS loan_products (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  interest_rate_annual REAL NOT NULL,
+  penalty_daily REAL DEFAULT 0.0,
+  term_months INTEGER NOT NULL,
+  repayment_frequency TEXT NOT NULL DEFAULT 'monthly'
+);
+
+CREATE TABLE IF NOT EXISTS loans (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  borrower_id INTEGER NOT NULL REFERENCES borrowers(id),
+  product_id INTEGER NOT NULL REFERENCES loan_products(id),
+  principal REAL NOT NULL,
+  disbursed_at TEXT,
+  status TEXT NOT NULL DEFAULT 'approved',
+  interest_rate_annual REAL NOT NULL,
+  term_months INTEGER NOT NULL,
+  repayment_frequency TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_by INTEGER REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS disbursements (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  loan_id INTEGER NOT NULL REFERENCES loans(id),
+  amount REAL NOT NULL,
+  method TEXT,
+  reference TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_by INTEGER REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS repayments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  loan_id INTEGER NOT NULL REFERENCES loans(id),
+  amount REAL NOT NULL,
+  paid_at TEXT NOT NULL,
+  method TEXT,
+  reference TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_by INTEGER REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS loan_schedule (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  loan_id INTEGER NOT NULL REFERENCES loans(id) ON DELETE CASCADE,
+  installment_no INTEGER NOT NULL,
+  due_date TEXT NOT NULL,
+  due_amount REAL NOT NULL,
+  principal_component REAL NOT NULL,
+  interest_component REAL NOT NULL,
+  paid_amount REAL NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'due'
+);
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER,
+  action TEXT NOT NULL,
+  entity TEXT,
+  entity_id INTEGER,
+  meta TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+```
+
+---
+
+## server.js (Turnkey backend — complete)
+
+> Save this as `server.js`. It includes DB init, REST API, basic security, seed admin, and an installer flag `--init` to create DB and seed.
+
+```js
+import express from 'express';
+import fs from 'fs';
+import path from 'path';
+import dotenv from 'dotenv';
+import helmet from 'helmet';
+import cors from 'cors';
+import rateLimit from 'express-rate-limit';
+import jwt from 'jsonwebtoken';
+import bcrypt from 'bcrypt';
+import sqlite3 from 'sqlite3';
+import { open } from 'sqlite';
+import Joi from 'joi';
+import dayjs from 'dayjs';
+import { v4 as uuidv4 } from 'uuid';
+
+dotenv.config();
+const app = express();
+const PORT = process.env.PORT || 8080;
+const DB_PATH = process.env.DB_PATH || './data/loanapp.sqlite';
+const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret';
+const HOSTNAME = process.env.HOSTNAME || 'localhost';
+
+const __dirname = path.resolve();
+fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+
+let db;
+async function getDb() {
+  if (!db) {
+    db = await open({ filename: DB_PATH, driver: sqlite3.Database });
+    await db.exec('PRAGMA foreign_keys = ON');
+  }
+  return db;
+}
+
+app.use(helmet());
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use('/public', express.static(path.join(__dirname, 'public')));
+const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 500 });
+app.use(limiter);
+
+function audit(userId, action, entity, entityId, meta) {
+  getDb().then(d => d.run(
+    `INSERT INTO audit_logs(user_id, action, entity, entity_id, meta) VALUES(?,?,?,?,?)`,
+    [userId || null, action, entity || null, entityId || null, meta ? JSON.stringify(meta) : null]
+  ));
+}
+
+function auth(required = true) {
+  return (req, res, next) => {
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+    if (!token) {
+      if (required) return res.status(401).json({ error: 'Auth required' });
+      req.user = null; return next();
+    }
+    try {
+      const payload = jwt.verify(token, JWT_SECRET);
+      req.user = payload; next();
+    } catch (e) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+  };
+}
+
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!req.user || !roles.includes(req.user.role)) return res.status(403).json({ error: 'Forbidden' });
+    next();
+  };
+}
+
+const borrowerSchema = Joi.object({
+  first_name: Joi.string().required(),
+  last_name: Joi.string().required(),
+  id_number: Joi.string().allow('', null),
+  phone: Joi.string().allow('', null),
+  email: Joi.string().email().allow('', null),
+  address: Joi.string().allow('', null)
+});
+
+const productSchema = Joi.object({
+  name: Joi.string().required(),
+  interest_rate_annual: Joi.number().min(0).max(2).required(),
+  penalty_daily: Joi.number().min(0).max(1).default(0),
+  term_months: Joi.number().integer().min(1).max(240).required(),
+  repayment_frequency: Joi.string().valid('monthly', 'weekly').required()
+});
+
+const loanSchema = Joi.object({
+  borrower_id: Joi.number().required(),
+  product_id: Joi.number().required(),
+  principal: Joi.number().min(1).required()
+});
+
+function generateSchedule({ principal, annualRate, termMonths, startDate, frequency }) {
+  const periods = frequency === 'weekly' ? termMonths * 4 : termMonths;
+  const ratePer = frequency === 'weekly' ? annualRate / 52 : annualRate / 12;
+  const pmt = (principal * ratePer) / (1 - Math.pow(1 + ratePer, -periods));
+  const schedule = [];
+  let bal = principal;
+  let due = dayjs(startDate);
+  for (let i = 1; i <= periods; i++) {
+    due = frequency === 'weekly' ? due.add(1, 'week') : due.add(1, 'month');
+    const interest = bal * ratePer;
+    let principalComp = pmt - interest;
+    if (i === periods) principalComp = bal;
+    bal = Math.max(0, bal - principalComp);
+    schedule.push({
+      installment_no: i,
+      due_date: due.format('YYYY-MM-DD'),
+      due_amount: +(principalComp + interest).toFixed(2),
+      principal_component: +principalComp.toFixed(2),
+      interest_component: +interest.toFixed(2)
+    });
+  }
+  return schedule;
+}
+
+app.get('/', (req, res) => res.redirect('/public/index.html'));
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    const db = await getDb();
+    const u = await db.get(`SELECT * FROM users WHERE email = ?`, [email]);
+    if (!u) return res.status(401).json({ error: 'Invalid credentials' });
+    const ok = await bcrypt.compare(password, u.password_hash);
+    if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+    const token = jwt.sign({ id: u.id, name: u.name, role: u.role }, JWT_SECRET, { expiresIn: '8h' });
+    res.json({ token, user: { id: u.id, name: u.name, role: u.role, email: u.email } });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/borrowers', auth(), async (req, res) => {
+  const db = await getDb();
+  const rows = await db.all(`SELECT * FROM borrowers ORDER BY id DESC`);
+  res.json(rows);
+});
+
+app.post('/api/borrowers', auth(), async (req, res) => {
+  try {
+    const { value, error } = borrowerSchema.validate(req.body);
+    if (error) return res.status(400).json({ error: error.message });
+    const db = await getDb();
+    const r = await db.run(
+      `INSERT INTO borrowers(first_name,last_name,id_number,phone,email,address,created_by) VALUES(?,?,?,?,?,?,?)`,
+      [value.first_name, value.last_name, value.id_number, value.phone, value.email, value.address, req.user.id]
+    );
+    audit(req.user.id, 'create', 'borrower', r.lastID, value);
+    res.json({ id: r.lastID });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/products', auth(), async (req, res) => {
+  const db = await getDb();
+  const rows = await db.all(`SELECT * FROM loan_products ORDER BY id DESC`);
+  res.json(rows);
+});
+
+app.post('/api/products', auth(), requireRole('admin'), async (req, res) => {
+  try {
+    const { value, error } = productSchema.validate(req.body);
+    if (error) return res.status(400).json({ error: error.message });
+    const db = await getDb();
+    const r = await db.run(
+      `INSERT INTO loan_products(name,interest_rate_annual,penalty_daily,term_months,repayment_frequency) VALUES(?,?,?,?,?)`,
+      [value.name, value.interest_rate_annual, value.penalty_daily, value.term_months, value.repayment_frequency]
+    );
+    audit(req.user.id, 'create', 'loan_product', r.lastID, value);
+    res.json({ id: r.lastID });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/loans', auth(), async (req, res) => {
+  try {
+    const { value, error } = loanSchema.validate(req.body);
+    if (error) return res.status(400).json({ error: error.message });
+    const db = await getDb();
+    const product = await db.get(`SELECT * FROM loan_products WHERE id = ?`, [value.product_id]);
+    if (!product) return res.status(400).json({ error: 'Invalid product' });
+    const r = await db.run(
+      `INSERT INTO loans(borrower_id,product_id,principal,status,interest_rate_annual,term_months,repayment_frequency,created_by)
+       VALUES(?,?,?,?,?,?,?,?)`,
+      [value.borrower_id, value.product_id, value.principal, 'approved', product.interest_rate_annual, product.term_months, product.repayment_frequency, req.user.id]
+    );
+    audit(req.user.id, 'create', 'loan', r.lastID, value);
+    res.json({ id: r.lastID });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/loans/:id/disburse', auth(), async (req, res) => {
+  try {
+    const db = await getDb();
+    const loan = await db.get(`SELECT * FROM loans WHERE id = ?`, [req.params.id]);
+    if (!loan) return res.status(404).json({ error: 'Loan not found' });
+    if (loan.disbursed_at) return res.status(400).json({ error: 'Already disbursed' });
+
+    const amount = loan.principal;
+    const { method = 'cash', reference = '' } = req.body || {};
+
+    await db.run(`UPDATE loans SET disbursed_at = datetime('now'), status='active' WHERE id = ?`, [loan.id]);
+    const dr = await db.run(`INSERT INTO disbursements(loan_id, amount, method, reference, created_by) VALUES(?,?,?,?,?)`,
+      [loan.id, amount, method, reference, req.user.id]);
+
+    const schedule = generateSchedule({
+      principal: loan.principal,
+      annualRate: loan.interest_rate_annual,
+      termMonths: loan.term_months,
+      startDate: dayjs().format('YYYY-MM-DD'),
+      frequency: loan.repayment_frequency
+    });
+
+    const stmt = await db.prepare(
+      `INSERT INTO loan_schedule(loan_id, installment_no, due_date, due_amount, principal_component, interest_component)
+       VALUES(?,?,?,?,?,?)`
+    );
+    try {
+      await db.exec('BEGIN');
+      for (const s of schedule) {
+        await stmt.run(loan.id, s.installment_no, s.due_date, s.due_amount, s.principal_component, s.interest_component);
+      }
+      await db.exec('COMMIT');
+    } catch (e) {
+      await db.exec('ROLLBACK');
+      throw e;
+    } finally { await stmt.finalize(); }
+
+    audit(req.user.id, 'disburse', 'loan', loan.id, { amount, method, reference });
+    res.json({ disbursement_id: dr.lastID });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/loans', auth(), async (req, res) => {
+  const db = await getDb();
+  const rows = await db.all(`SELECT l.*, b.first_name||' '||b.last_name as borrower_name, p.name as product_name FROM loans l JOIN borrowers b ON b.id = l.borrower_id JOIN loan_products p ON p.id = l.product_id ORDER BY l.id DESC`);
+  res.json(rows);
+});
+
+app.get('/api/loans/:id', auth(), async (req, res) => {
+  try {
+    const db = await getDb();
+    const loan = await db.get(`SELECT * FROM loans WHERE id = ?`, [req.params.id]);
+    if (!loan) return res.status(404).json({ error: 'Not found' });
+    const borrower = await db.get(`SELECT * FROM borrowers WHERE id = ?`, [loan.borrower_id]);
+    const schedule = await db.all(`SELECT * FROM loan_schedule WHERE loan_id = ? ORDER BY installment_no`, [loan.id]);
+    const reps = await db.all(`SELECT * FROM repayments WHERE loan_id = ? ORDER BY paid_at DESC`, [loan.id]);
+    const disb = await db.all(`SELECT * FROM disbursements WHERE loan_id = ?`, [loan.id]);
+    res.json({ loan, borrower, schedule, repayments: reps, disbursements: disb });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/loans/:id/repayments', auth(), async (req, res) => {
+  try {
+    const { amount, method = 'cash', reference = '', paid_at } = req.body || {};
+    if (!amount || amount <= 0) return res.status(400).json({ error: 'Invalid amount' });
+    const db = await getDb();
+    const loan = await db.get(`SELECT * FROM loans WHERE id = ?`, [req.params.id]);
+    if (!loan) return res.status(404).json({ error: 'Loan not found' });
+
+    const rep = await db.run(`INSERT INTO repayments(loan_id, amount, method, reference, paid_at, created_by) VALUES(?,?,?,?,?,?)`,
+      [loan.id, amount, method, reference, paid_at || dayjs().format('YYYY-MM-DD'), req.user.id]);
+
+    let remaining = amount;
+    const rows = await db.all(`SELECT * FROM loan_schedule WHERE loan_id = ? ORDER BY installment_no`, [loan.id]);
+    for (const r of rows) {
+      if (remaining <= 0) break;
+      const dueLeft = Math.max(0, r.due_amount - r.paid_amount);
+      if (dueLeft > 0) {
+        const pay = Math.min(remaining, dueLeft);
+        await db.run(`UPDATE loan_schedule SET paid_amount = paid_amount + ?, status = CASE WHEN paid_amount + ? >= due_amount THEN 'paid' ELSE 'partial' END WHERE id = ?`,
+          [pay, pay, r.id]);
+        remaining -= pay;
+      }
+    }
+
+    await recalcLoanStatus(loan.id);
+    audit(req.user.id, 'repayment', 'loan', loan.id, { amount, method, reference });
+    res.json({ repayment_id: rep.lastID, unallocated: +remaining.toFixed(2) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+async function recalcLoanStatus(loanId) {
+  const db = await getDb();
+  const sched = await db.all(`SELECT due_amount, paid_amount, due_date FROM loan_schedule WHERE loan_id = ? ORDER BY installment_no`, [loanId]);
+  if (sched.length === 0) { await db.run(`UPDATE loans SET status='approved' WHERE id = ?`, [loanId]); return; }
+  const allPaid = sched.every(s => s.paid_amount >= s.due_amount - 0.01);
+  if (allPaid) { await db.run(`UPDATE loans SET status='closed' WHERE id = ?`, [loanId]); return; }
+  const overdue = sched.some(s => dayjs(s.due_date).isBefore(dayjs(), 'day') && s.paid_amount < s.due_amount - 0.01);
+  await db.run(`UPDATE loans SET status = ? WHERE id = ?`, [overdue ? 'in_arrears' : 'active', loanId]);
+}
+
+app.post('/api/housekeeping/run', auth(), requireRole('admin','officer'), async (req, res) => {
+  try {
+    const db = await getDb();
+    const loans = await db.all(`SELECT l.id FROM loans l WHERE l.status IN ('active','in_arrears')`);
+    for (const l of loans) {
+      const schedule = await db.all(`SELECT * FROM loan_schedule WHERE loan_id = ?`, [l.id]);
+      for (const s of schedule) {
+        const overdue = dayjs(s.due_date).isBefore(dayjs(), 'day') && s.paid_amount < s.due_amount - 0.01;
+        const newStatus = s.paid_amount >= s.due_amount - 0.01 ? 'paid' : (overdue ? 'overdue' : (s.paid_amount > 0 ? 'partial' : 'due'));
+        if (newStatus !== s.status) await db.run(`UPDATE loan_schedule SET status = ? WHERE id = ?`, [newStatus, s.id]);
+      }
+      await recalcLoanStatus(l.id);
+    }
+    audit(req.user?.id, 'housekeeping', 'system', null, { date: dayjs().format() });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/reports/portfolio', auth(), async (req, res) => {
+  try {
+    const db = await getDb();
+    const loans = await db.all(`SELECT id FROM loans WHERE status IN ('active','in_arrears')`);
+    let outstanding = 0, arrears = 0, installments = 0, overdueInstallments = 0;
+    for (const l of loans) {
+      const rows = await db.all(`SELECT due_amount, paid_amount, due_date FROM loan_schedule WHERE loan_id = ?`, [l.id]);
+      for (const r of rows) {
+        outstanding += Math.max(0, r.due_amount - r.paid_amount);
+        const isOverdue = dayjs(r.due_date).isBefore(dayjs(), 'day') && r.paid_amount < r.due_amount - 0.01;
+        if (isOverdue) { arrears += (r.due_amount - r.paid_amount); overdueInstallments++; }
+        installments++;
+      }
+    }
+    const par_installment_ratio = installments ? overdueInstallments / installments : 0;
+    res.json({ outstanding: +outstanding.toFixed(2), arrears: +arrears.toFixed(2), par_installment_ratio: +par_installment_ratio.toFixed(3) });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/reports/cashflow', auth(), async (req, res) => {
+  try {
+    const db = await getDb();
+    const { from, to } = req.query;
+    if (!from || !to) return res.status(400).json({ error: 'from and to are required (YYYY-MM-DD)' });
+    const rowsD = await db.all(`SELECT date(created_at) d, SUM(amount) total FROM disbursements WHERE date(created_at) BETWEEN ? AND ? GROUP BY d`, [from, to]);
+    const rowsR = await db.all(`SELECT date(paid_at) d, SUM(amount) total FROM repayments WHERE date(paid_at) BETWEEN ? AND ? GROUP BY d`, [from, to]);
+    res.json({ disbursements: rowsD, repayments: rowsR });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+async function initDb() {
+  const db = await getDb();
+  const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf-8');
+  await db.exec(schema);
+  const userCount = await db.get(`SELECT COUNT(*) as c FROM users`);
+  if (userCount.c === 0) {
+    const pwd = await bcrypt.hash(process.env.ADMIN_PASS || 'admin123', 10);
+    await db.run(`INSERT INTO users(name,email,password_hash,role) VALUES(?,?,?,?)`, ['Admin', process.env.ADMIN_EMAIL || 'admin@local', pwd, 'admin']);
+    await db.run(`INSERT INTO loan_products(name,interest_rate_annual,penalty_daily,term_months,repayment_frequency) VALUES(?,?,?,?,?)`, ['Standard 24% 12m', 0.24, 0.001, 12, 'monthly']);
+    console.log('Seeded admin and sample product.');
+  }
+}
+
+const args = process.argv.slice(2);
+if (args.includes('--init')) {
+  initDb().then(() => { console.log('DB initialized'); process.exit(0); }).catch(e => { console.error('Init failed', e); process.exit(1); });
+} else {
+  (async () => { await initDb(); app.listen(PORT, () => console.log(`Server running on http://${HOSTNAME}:${PORT}`)); })();
+}
+```
+
+---
+
+## README / Quick Install
+
+```
+1. Create project folder and paste files:
+   - package.json
+   - .env (copy .env.example)
+   - schema.sql
+   - server.js
+   - public/ (copy frontend files if you have them)
+
+2. Install:
+   npm install
+
+3. Initialize DB and seed admin:
+   npm run init-db
+
+4. Start server:
+   npm start
+
+5. Visit: http://localhost:8080 (default admin: use .env ADMIN_EMAIL/ADMIN_PASS)
+```
+
+import React from "react";
+import { BrowserRouter as Router, Route, Routes, Navigate } from "react-router-dom";
+import { useState } from "react";
+
+// Pages
+import LoginPage from "./pages/LoginPage";
+import Dashboard from "./pages/Dashboard";
+import LoanApplications from "./pages/LoanApplications";
+import Borrowers from "./pages/Borrowers";
+import Reports from "./pages/Reports";
+
+// Layout
+import Sidebar from "./components/Sidebar";
+
+function App() {
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+
+  return (
+    <Router>
+      {isAuthenticated ? (
+        <div className="flex h-screen bg-gray-100">
+          <Sidebar />
+          <div className="flex-1 p-6 overflow-y-auto">
+            <Routes>
+              <Route path="/dashboard" element={<Dashboard />} />
+              <Route path="/loan-applications" element={<LoanApplications />} />
+              <Route path="/borrowers" element={<Borrowers />} />
+              <Route path="/reports" element={<Reports />} />
+              <Route path="*" element={<Navigate to="/dashboard" />} />
+            </Routes>
+          </div>
+        </div>
+      ) : (
+        <Routes>
+          <Route path="/login" element={<LoginPage setIsAuthenticated={setIsAuthenticated} />} />
+          <Route path="*" element={<Navigate to="/login" />} />
+        </Routes>
+      )}
+    </Router>
+  );
+}
+
+export default App;
+import React, { useState } from "react";
+import axios from "axios";
+
+function LoginPage({ setIsAuthenticated }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    try {
+      const res = await axios.post("http://localhost:5000/api/auth/login", {
+        username,
+        password,
+      });
+      localStorage.setItem("token", res.data.token);
+      setIsAuthenticated(true);
+    } catch (err) {
+      setError("Invalid credentials");
+    }
+  };
+
+  return (
+    <div className="flex items-center justify-center h-screen bg-gray-200">
+      <div className="bg-white p-8 rounded-2xl shadow-md w-96">
+        <h2 className="text-xl font-bold mb-4 text-center">Login</h2>
+        {error && <p className="text-red-500 text-sm mb-2">{error}</p>}
+        <form onSubmit={handleLogin}>
+          <input
+            type="text"
+            placeholder="Username"
+            className="w-full p-2 border rounded mb-3"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+          />
+          <input
+            type="password"
+            placeholder="Password"
+            className="w-full p-2 border rounded mb-3"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
+          <button
+            type="submit"
+            className="w-full bg-blue-500 text-white p-2 rounded hover:bg-blue-600"
+          >
+            Login
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+export default LoginPage;
+import React, { useState } from "react";
+import axios from "axios";
+
+function BorrowerForm({ onSuccess }) {
+  const [formData, setFormData] = useState({
+    full_name: "",
+    email: "",
+    phone: "",
+    national_id: "",
+    address: "",
+  });
+
+  const handleChange = (e) => {
+    setFormData({ ...formData, [e.target.name]: e.target.value });
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    try {
+      const token = localStorage.getItem("token");
+      await axios.post("http://localhost:5000/api/borrowers", formData, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      onSuccess();
+    } catch (err) {
+      console.error("Error adding borrower", err);
+    }
+  };
+
+  return (
+    <form
+      onSubmit={handleSubmit}
+      className="bg-white p-6 rounded-2xl shadow-md max-w-lg"
+    >
+      <h3 className="text-lg font-bold mb-4">Add New Borrower</h3>
+      <input
+        type="text"
+        name="full_name"
+        placeholder="Full Name"
+        className="w-full p-2 border rounded mb-3"
+        value={formData.full_name}
+        onChange={handleChange}
+        required
+      />
+      <input
+        type="email"
+        name="email"
+        placeholder="Email"
+        className="w-full p-2 border rounded mb-3"
+        value={formData.email}
+        onChange={handleChange}
+        required
+      />
+      <input
+        type="text"
+        name="phone"
+        placeholder="Phone Number"
+        className="w-full p-2 border rounded mb-3"
+        value={formData.phone}
+        onChange={handleChange}
+        required
+      />
+      <input
+        type="text"
+        name="national_id"
+        placeholder="National ID"
+        className="w-full p-2 border rounded mb-3"
+        value={formData.national_id}
+        onChange={handleChange}
+        required
+      />
+      <textarea
+        name="address"
+        placeholder="Address"
+        className="w-full p-2 border rounded mb-3"
+        value={formData.address}
+        onChange={handleChange}
+        required
+      />
+      <button
+        type="submit"
+        className="w-full bg-green-500 text-white p-2 rounded hover:bg-green-600"
+      >
+        Save Borrower
+      </button>
+    </form>
+  );
+}
+
+export default BorrowerForm;
+import React, { useState, useEffect } from "react";
+import axios from "axios";
+
+function LoanApplicationForm({ onSuccess }) {
+  const [borrowers, setBorrowers] = useState([]);
+  const [formData, setFormData] = useState({
+    borrower_id: "",
+    principal_amount: "",
+    interest_rate: "",
+    term_months: "",
+    disbursement_date: "",
+  });
+
+  // Fetch borrowers for dropdown
+  useEffect(() => {
+    const fetchBorrowers = async () => {
+      try {
+        const token = localStorage.getItem("token");
+        const res = await axios.get("http://localhost:5000/api/borrowers", {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        setBorrowers(res.data);
+      } catch (err) {
+        console.error("Error fetching borrowers", err);
+      }
+    };
+    fetchBorrowers();
+  }, []);
+
+  const handleChange = (e) => {
+    setFormData({ ...formData, [e.target.name]: e.target.value });
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    try {
+      const token = localStorage.getItem("token");
+      await axios.post("http://localhost:5000/api/loans", formData, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      onSuccess();
+    } catch (err) {
+      console.error("Error creating loan", err);
+    }
+  };
+
+  return (
+    <form
+      onSubmit={handleSubmit}
+      className="bg-white p-6 rounded-2xl shadow-md max-w-lg"
+    >
+      <h3 className="text-lg font-bold mb-4">Create New Loan</h3>
+
+      {/* Borrower Dropdown */}
+      <label className="block mb-2 text-sm font-medium">Borrower</label>
+      <select
+        name="borrower_id"
+        className="w-full p-2 border rounded mb-3"
+        value={formData.borrower_id}
+        onChange={handleChange}
+        required
+      >
+        <option value="">Select Borrower</option>
+        {borrowers.map((b) => (
+          <option key={b.id} value={b.id}>
+            {b.full_name} ({b.national_id})
+          </option>
+        ))}
+      </select>
+
+      {/* Loan Details */}
+      <input
+        type="number"
+        name="principal_amount"
+        placeholder="Principal Amount"
+        className="w-full p-2 border rounded mb-3"
+        value={formData.principal_amount}
+        onChange={handleChange}
+        required
+      />
+      <input
+        type="number"
+        step="0.01"
+        name="interest_rate"
+        placeholder="Interest Rate (%)"
+        className="w-full p-2 border rounded mb-3"
+        value={formData.interest_rate}
+        onChange={handleChange}
+        required
+      />
+      <input
+        type="number"
+        name="term_months"
+        placeholder="Loan Term (Months)"
+        className="w-full p-2 border rounded mb-3"
+        value={formData.term_months}
+        onChange={handleChange}
+        required
+      />
+
+      {/* Disbursement Date */}
+      <label className="block mb-2 text-sm font-medium">Disbursement Date</label>
+      <input
+        type="date"
+        name="disbursement_date"
+        className="w-full p-2 border rounded mb-3"
+        value={formData.disbursement_date}
+        onChange={handleChange}
+        required
+      />
+
+      {/* Submit */}
+      <button
+        type="submit"
+        className="w-full bg-blue-500 text-white p-2 rounded hover:bg-blue-600"
+      >
+        Approve & Disburse Loan
+      </button>
+    </form>
+  );
+}
+
+export default LoanApplicationForm;
+import React, { useState, useEffect } from "react";
+import axios from "axios";
+
+function RepaymentForm({ loanId, onSuccess }) {
+  const [loan, setLoan] = useState(null);
+  const [formData, setFormData] = useState({
+    repayment_amount: "",
+    repayment_date: "",
+    method: "Cash", // default
+  });
+
+  // Fetch loan details
+  useEffect(() => {
+    const fetchLoan = async () => {
+      try {
+        const token = localStorage.getItem("token");
+        const res = await axios.get(
+          `http://localhost:5000/api/loans/${loanId}`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        setLoan(res.data);
+      } catch (err) {
+        console.error("Error fetching loan", err);
+      }
+    };
+    fetchLoan();
+  }, [loanId]);
+
+  const handleChange = (e) => {
+    setFormData({ ...formData, [e.target.name]: e.target.value });
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    try {
+      const token = localStorage.getItem("token");
+      await axios.post(
+        `http://localhost:5000/api/repayments`,
+        { ...formData, loan_id: loanId },
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      onSuccess();
+    } catch (err) {
+      console.error("Error recording repayment", err);
+    }
+  };
+
+  return (
+    <div className="bg-white p-6 rounded-2xl shadow-md max-w-lg">
+      <h3 className="text-lg font-bold mb-4">Record Repayment</h3>
+
+      {loan && (
+        <div className="mb-4 p-3 bg-gray-100 rounded">
+          <p>
+            <strong>Borrower:</strong> {loan.borrower_name}
+          </p>
+          <p>
+            <strong>Loan Balance:</strong> R {loan.outstanding_balance}
+          </p>
+        </div>
+      )}
+
+      <form onSubmit={handleSubmit}>
+        <input
+          type="number"
+          name="repayment_amount"
+          placeholder="Repayment Amount"
+          className="w-full p-2 border rounded mb-3"
+          value={formData.repayment_amount}
+          onChange={handleChange}
+          required
+        />
+
+        <label className="block mb-2 text-sm font-medium">Repayment Date</label>
+        <input
+          type="date"
+          name="repayment_date"
+          className="w-full p-2 border rounded mb-3"
+          value={formData.repayment_date}
+          onChange={handleChange}
+          required
+        />
+
+        <label className="block mb-2 text-sm font-medium">Payment Method</label>
+        <select
+          name="method"
+          className="w-full p-2 border rounded mb-3"
+          value={formData.method}
+          onChange={handleChange}
+        >
+          <option value="Cash">Cash</option>
+          <option value="Bank Transfer">Bank Transfer</option>
+          <option value="Debit Order">Debit Order</option>
+          <option value="Mobile Money">Mobile Money</option>
+        </select>
+
+        <button
+          type="submit"
+          className="w-full bg-green-500 text-white p-2 rounded hover:bg-green-600"
+        >
+          Record Repayment
+        </button>
+      </form>
+    </div>
+  );
+}
+
+export default RepaymentForm;
+import React, { useEffect, useState } from "react";
+import axios from "axios";
+
+function RepaymentHistory({ loanId }) {
+  const [repayments, setRepayments] = useState([]);
+
+  useEffect(() => {
+    const fetchRepayments = async () => {
+      try {
+        const token = localStorage.getItem("token");
+        const res = await axios.get(
+          `http://localhost:5000/api/repayments/${loanId}`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        setRepayments(res.data);
+      } catch (err) {
+        console.error("Error fetching repayments", err);
+      }
+    };
+    fetchRepayments();
+  }, [loanId]);
+
+  return (
+    <div className="bg-white p-6 rounded-2xl shadow-md mt-6">
+      <h3 className="text-lg font-bold mb-4">Repayment History</h3>
+
+      {repayments.length === 0 ? (
+        <p className="text-gray-600">No repayments recorded yet.</p>
+      ) : (
+        <table className="w-full border-collapse border border-gray-200">
+          <thead>
+            <tr className="bg-gray-100 text-left">
+              <th className="p-2 border">Date</th>
+              <th className="p-2 border">Amount</th>
+              <th className="p-2 border">Method</th>
+              <th className="p-2 border">Running Balance</th>
+            </tr>
+          </thead>
+          <tbody>
+            {repayments.map((repayment, index) => (
+              <tr key={index} className="hover:bg-gray-50">
+                <td className="p-2 border">
+                  {new Date(repayment.repayment_date).toLocaleDateString()}
+                </td>
+                <td className="p-2 border">R {repayment.repayment_amount}</td>
+                <td className="p-2 border">{repayment.method}</td>
+                <td className="p-2 border">R {repayment.running_balance}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+export default RepaymentHistory;
+// Get repayments for a loan
+router.get("/repayments/:loanId", authMiddleware, async (req, res) => {
+  try {
+    const { loanId } = req.params;
+    const repayments = await db("repayments")
+      .where({ loan_id: loanId })
+      .orderBy("repayment_date", "asc");
+    res.json(repayments);
+  } catch (err) {
+    res.status(500).json({ error: "Error fetching repayments" });
+  }
+});
+import React, { useEffect, useState } from "react";
+import axios from "axios";
+import { PieChart, Pie, Cell, Tooltip, BarChart, Bar, XAxis, YAxis, CartesianGrid } from "recharts";
+
+function Dashboard() {
+  const [summary, setSummary] = useState({
+    totalDisbursed: 0,
+    totalRepaid: 0,
+    outstanding: 0,
+    arrears: 0,
+    repaymentRate: 0,
+  });
+  const [monthlyData, setMonthlyData] = useState([]);
+
+  useEffect(() => {
+    const fetchSummary = async () => {
+      try {
+        const token = localStorage.getItem("token");
+        const res = await axios.get("http://localhost:5000/api/dashboard", {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        setSummary(res.data.summary);
+        setMonthlyData(res.data.monthly);
+      } catch (err) {
+        console.error("Error fetching dashboard data", err);
+      }
+    };
+    fetchSummary();
+  }, []);
+
+  return (
+    <div className="p-6">
+      <h2 className="text-2xl font-bold mb-6">Loan Portfolio Dashboard</h2>
+
+      {/* KPIs */}
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
+        <div className="bg-white p-6 rounded-2xl shadow-md">
+          <h3 className="text-gray-600">Total Disbursed</h3>
+          <p className="text-2xl font-bold">R {summary.totalDisbursed}</p>
+        </div>
+        <div className="bg-white p-6 rounded-2xl shadow-md">
+          <h3 className="text-gray-600">Total Repaid</h3>
+          <p className="text-2xl font-bold">R {summary.totalRepaid}</p>
+        </div>
+        <div className="bg-white p-6 rounded-2xl shadow-md">
+          <h3 className="text-gray-600">Outstanding</h3>
+          <p className="text-2xl font-bold">R {summary.outstanding}</p>
+        </div>
+        <div className="bg-white p-6 rounded-2xl shadow-md">
+          <h3 className="text-gray-600">Repayment Rate</h3>
+          <p className="text-2xl font-bold">{summary.repaymentRate}%</p>
+        </div>
+      </div>
+
+      {/* Charts */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        {/* Pie Chart for Arrears */}
+        <div className="bg-white p-6 rounded-2xl shadow-md">
+          <h3 className="text-lg font-bold mb-4">Portfolio Health</h3>
+          <PieChart width={400} height={300}>
+            <Pie
+              data={[
+                { name: "Outstanding", value: summary.outstanding },
+                { name: "Arrears", value: summary.arrears },
+              ]}
+              cx={200}
+              cy={150}
+              innerRadius={60}
+              outerRadius={100}
+              fill="#8884d8"
+              dataKey="value"
+              label
+            >
+              <Cell fill="#82ca9d" />
+              <Cell fill="#ff6b6b" />
+            </Pie>
+            <Tooltip />
+          </PieChart>
+        </div>
+
+        {/* Bar Chart for Monthly Trends */}
+        <div className="bg-white p-6 rounded-2xl shadow-md">
+          <h3 className="text-lg font-bold mb-4">Monthly Disbursements vs Repayments</h3>
+          <BarChart width={400} height={300} data={monthlyData}>
+            <CartesianGrid strokeDasharray="3 3" />
+            <XAxis dataKey="month" />
+            <YAxis />
+            <Tooltip />
+            <Bar dataKey="disbursed" fill="#8884d8" />
+            <Bar dataKey="repaid" fill="#82ca9d" />
+          </BarChart>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default Dashboard;
+router.get("/dashboard", authMiddleware, async (req, res) => {
+  try {
+    const totalDisbursed = await db("loans").sum("loan_amount as total").first();
+    const totalRepaid = await db("repayments").sum("repayment_amount as total").first();
+    const outstanding = (totalDisbursed.total || 0) - (totalRepaid.total || 0);
+
+    const arrears = await db("loans")
+      .where("due_date", "<", new Date())
+      .andWhere("status", "!=", "closed")
+      .sum("loan_amount as total")
+      .first();
+
+    const repaymentRate = totalDisbursed.total
+      ? ((totalRepaid.total / totalDisbursed.total) * 100).toFixed(2)
+      : 0;
+
+    // Monthly trends (last 6 months)
+    const monthly = await db.raw(`
+      SELECT to_char(disbursed_date, 'Mon') as month,
+             SUM(loan_amount) as disbursed,
+             COALESCE((SELECT SUM(repayment_amount) 
+                       FROM repayments 
+                       WHERE to_char(repayment_date, 'Mon') = to_char(loans.disbursed_date, 'Mon')), 0) as repaid
+      FROM loans
+      GROUP BY month
+      ORDER BY MIN(disbursed_date) DESC
+      LIMIT 6;
+    `);
+
+    res.json({
+      summary: {
+        totalDisbursed: totalDisbursed.total || 0,
+        totalRepaid: totalRepaid.total || 0,
+        outstanding,
+        arrears: arrears.total || 0,
+        repaymentRate,
+      },
+      monthly: monthly.rows,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Dashboard fetch failed" });
+  }
+});
+// utils/calcOutstanding.js
+async function calcOutstanding(db, loanId) {
+  // Fetch loan amount
+  const loan = await db("loans").where({ id: loanId }).first();
+
+  // Sum repayments
+  const repayments = await db("repayments")
+    .where({ loan_id: loanId })
+    .sum("repayment_amount as total")
+    .first();
+
+  const totalRepaid = repayments.total || 0;
+  const outstanding = (loan.loan_amount || 0) - totalRepaid;
+
+  return {
+    totalRepaid,
+    outstanding: outstanding < 0 ? 0 : outstanding, // safeguard
+  };
+}
+
+module.exports = calcOutstanding;
+const calcOutstanding = require("../utils/calcOutstanding");
+
+router.post("/repayments", authMiddleware, async (req, res) => {
+  try {
+    const { loan_id, repayment_amount, repayment_date } = req.body;
+
+    await db("repayments").insert({
+      loan_id,
+      repayment_amount,
+      repayment_date,
+    });
+
+    // Recalculate outstanding
+    const { totalRepaid, outstanding } = await calcOutstanding(db, loan_id);
+
+    // Update loan table with latest figures
+    await db("loans").where({ id: loan_id }).update({
+      total_repaid: totalRepaid,
+      outstanding_balance: outstanding,
+      status: outstanding === 0 ? "closed" : "active",
+    });
+
+    res.json({ message: "Repayment recorded", outstanding, totalRepaid });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to record repayment" });
+  }
+});
+router.post("/loans", authMiddleware, async (req, res) => {
+  try {
+    const { borrower_id, loan_amount, disbursed_date, due_date } = req.body;
+
+    const [id] = await db("loans").insert({
+      borrower_id,
+      loan_amount,
+      disbursed_date,
+      due_date,
+      total_repaid: 0,
+      outstanding_balance: loan_amount,
+      status: "active",
+    }).returning("id");
+
+    res.json({ message: "Loan created", loanId: id });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to create loan" });
+  }
+});
+score = 100 * (0.5 * onTimeRatio + 0.3 * (1 - parRatio) + 0.2 * (1 - min(defaultCount/3,1)))
+ALTER TABLE borrowers ADD COLUMN risk_score REAL DEFAULT NULL;
+ALTER TABLE borrowers ADD COLUMN risk_label TEXT DEFAULT NULL;
+// ---------- RISK SCORING HELPERS ----------
+
+/**
+ * Compute borrower risk score between 0 and 100
+ * Uses installments and loan status from loan_schedule + loans
+ */
+async function computeBorrowerScore(borrowerId) {
+  const db = await getDb();
+
+  // Collect borrower's loans
+  const loans = await db.all(`SELECT id, status FROM loans WHERE borrower_id = ?`, [borrowerId]);
+  if (!loans || loans.length === 0) {
+    // No data: neutral score
+    return { score: 50, label: 'medium', meta: { reason: 'no_loans' } };
+  }
+
+  // Counters
+  let totalInstallments = 0;
+  let onTimeInstallments = 0;
+  let overdueInstallments = 0;
+  let defaultCount = 0;
+
+  for (const loan of loans) {
+    if (loan.status && loan.status.toLowerCase() === 'defaulted') defaultCount++;
+
+    const schedule = await db.all(`SELECT due_amount, paid_amount, due_date FROM loan_schedule WHERE loan_id = ?`, [loan.id]);
+    for (const s of schedule) {
+      totalInstallments++;
+      const paid = (s.paid_amount || 0) >= (s.due_amount || 0) - 0.01;
+      const isOverdue = dayjs(s.due_date).isBefore(dayjs(), 'day') && !paid;
+
+      if (paid) {
+        // To decide on-time vs late we need payment date(s); approximation:
+        // treat fully paid installments as on-time only if status != 'overdue'
+        // (we stored status per installment in schedule)
+        // fetch status if present:
+        // if schedule contains status column it should be used; fallback: assume on-time if not overdue now
+        onTimeInstallments += 1;
+      } else {
+        if (isOverdue) overdueInstallments++;
+      }
+    }
+  }
+
+  // Safety checks
+  if (totalInstallments === 0) {
+    return { score: 50, label: 'medium', meta: { reason: 'no_installments' } };
+  }
+
+  // Metrics
+  const onTimeRatio = Math.max(0, Math.min(1, onTimeInstallments / totalInstallments));
+  const parRatio = Math.max(0, Math.min(1, overdueInstallments / totalInstallments));
+  const defFactor = Math.min(defaultCount / 3, 1); // caps at 3 defaults
+
+  // Weights (tunable)
+  const wOnTime = 0.50;
+  const wPar = 0.30;
+  const wDefault = 0.20;
+
+  const scoreFloat =
+    100 *
+    (wOnTime * onTimeRatio +
+      wPar * (1 - parRatio) +
+      wDefault * (1 - defFactor));
+
+  const score = Math.round(Math.max(0, Math.min(100, scoreFloat)));
+
+  const label = score >= 80 ? 'low' : score >= 50 ? 'medium' : 'high';
+
+  return {
+    score,
+    label,
+    meta: {
+      totals: { totalInstallments, onTimeInstallments, overdueInstallments, defaultCount },
+      components: { onTimeRatio, parRatio, defFactor }
+    }
+  };
+}
+
+/**
+ * Write score back to borrowers table
+ */
+async function updateBorrowerScore(borrowerId) {
+  const db = await getDb();
+  const { score, label, meta } = await computeBorrowerScore(borrowerId);
+  await db.run(`UPDATE borrowers SET risk_score = ?, risk_label = ? WHERE id = ?`, [score, label, borrowerId]);
+  audit(null, 'score_update', 'borrower', borrowerId, { score, label, meta });
+  return { borrowerId, score, label, meta };
+}
+
+// ---------- END HELPER ---------- 
+// Get borrower score
+app.get('/api/borrowers/:id/score', auth(), async (req, res) => {
+  try {
+    const borrowerId = req.params.id;
+    const db = await getDb();
+    const b = await db.get(`SELECT id, risk_score, risk_label FROM borrowers WHERE id = ?`, [borrowerId]);
+    if (!b) return res.status(404).json({ error: 'Borrower not found' });
+
+    // If not set, compute on demand
+    if (b.risk_score === null || b.risk_label === null) {
+      const result = await updateBorrowerScore(borrowerId);
+      return res.json(result);
+    }
+    return res.json({ borrowerId: b.id, score: b.risk_score, label: b.risk_label });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Run scoring for all borrowers (admin/officer)
+app.post('/api/housekeeping/score-run', auth(), requireRole('admin','officer'), async (req, res) => {
+  try {
+    const db = await getDb();
+    const borrowers = await db.all(`SELECT id FROM borrowers`);
+    const results = [];
+    for (const b of borrowers) {
+      const r = await updateBorrowerScore(b.id);
+      results.push(r);
+    }
+    audit(req.user?.id, 'score_batch', 'system', null, { count: results.length });
+    res.json({ ok: true, updated: results.length, results });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+// after recording repayment and recalcLoanStatus(...)
+await updateBorrowerScore( borrowerId ); // borrowerId you have from the loan record
 
