@@ -8,6 +8,8 @@ This document contains the full **turnkey** starter code for a cash-loan managem
 
 ## package.json
 
+"homepage": "https://lefenyasfuture-ship-it.github.io/Cash-Loan-system/"
+
 ```json
 {
   "name": "turnkey-loan-app",
