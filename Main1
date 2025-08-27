@@ -1,18 +1,5 @@
-# Turnkey Cash Loan App — Starter Package
-
-This document contains the full **turnkey** starter code for a cash-loan management system you can ship to buyers. It includes all essential files: backend (Node.js/Express), database schema (SQLite for quick demo, PostgreSQL-ready), seed data, and deployment instructions.
-
-> Files included (paste each into its own file in a project folder):
-
----
-
-## package.json
-
-"homepage": "https://lefenyasfuture-ship-it.github.io/Cash-Loan-system/"
-
-```json
 {
-  "name": "turnkey-loan-app",
+  "name": "turnkey-loan-backend",
   "version": "1.0.0",
   "type": "module",
   "scripts": {
@@ -37,9 +24,30 @@ This document contains the full **turnkey** starter code for a cash-loan managem
     "nodemon": "^3.1.4"
   }
 }
-```
+{
+cd backend
+npm install
+npm run dev
 
----
+  "name": "turnkey-loan-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "homepage": "https://lefenyasfuture-ship-it.github.io/Cash-Loan-system/",
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-scripts": "5.0.1"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "predeploy": "npm run build",
+    "deploy": "gh-pages -d build"
+  },
+  "devDependencies": {
+    "gh-pages": "^5.0.0"
+  }
+}
 
 ## .env.example
 
